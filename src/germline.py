@@ -1,38 +1,44 @@
 #!/usr/bin/env python3
+"""
+germline.py -- germline SNV calling helpers for duopogen.
+
+Fork of Monopogen (KChen-lab), germline-only. Somatic modules removed.
+
+Changes from upstream are tagged in comments:
+  [FIX]   correctness bug in upstream
+  [PERF]  speed / memory
+  [3.14]  needed for Python 3.14
+  [ENV]   binaries now come from PATH, not a vendored apps/ dir
+"""
 
 import argparse
 import sys
 import os
 import logging
 import shutil
-import glob
-import re
-import pysam
-import time
 import subprocess
-import pandas as pd
-import numpy as np
-import gzip
-from pysam import VariantFile
-from bamProcess import * 
+import pysam
 import multiprocessing as mp
 from multiprocessing import Pool
 
+# [ENV] Dropped: pandas, numpy, gzip, glob, re, time, VariantFile.
+#       None are used once the monovar tree is deleted. numpy+pandas alone
+#       cost ~1.5 s of interpreter startup, paid once per region job.
 
-LIB_PATH = os.path.abspath(
-	os.path.join(os.path.dirname(os.path.realpath(__file__)), "pipelines/lib"))
+# [ENV] The only thing still vendored is the Beagle 4.1 jar. Beagle 5.x
+#       dropped gl= (genotype-likelihood) input, which this pipeline
+#       depends on, so bioconda's `beagle` package is NOT a substitute.
+#       Everything else resolves from the active conda env via PATH.
+APP_PATH = os.path.abspath(
+	os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "apps"))
+BEAGLE_JAR = os.path.join(APP_PATH, "beagle.27Jul16.86a.jar")
 
-if LIB_PATH not in sys.path:
-	sys.path.insert(0, LIB_PATH)
+# [PERF] Upstream hardcodes `for chr in range(1, 23)` in two places, which
+#        silently drops chrX/chrY. Add "chrX" here (and a matching panel
+#        file + region.lst entry) if you want it. Note chrX needs ploidy
+#        handling that Beagle will not infer on its own.
+CHROMS = ["chr" + str(i) for i in range(1, 23)]
 
-PIPELINE_BASEDIR = os.path.dirname(os.path.realpath(sys.argv[0]))
-CFG_DIR = os.path.join(PIPELINE_BASEDIR, "cfg")
-
-#import pipelines
-#from pipelines import get_cluster_cfgfile
-#from pipelines import PipelineHandler
-
-# global logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
@@ -44,101 +50,84 @@ logger.addHandler(handler)
 def print_parameters_given(args):
 	logger.info("Parameters in effect:")
 	for arg in vars(args):
-		if arg=="func": continue
+		if arg == "func":
+			continue
 		logger.info("--{} = [{}]".format(arg, vars(args)[arg]))
 
 
-def validate_sample_list_file(args):
-	if args.check_hard_clipped:
-		out=os.popen("command -v bioawk").read().strip()
-		assert out!="", "Program bioawk cannot be found!"
-
-	assert os.path.isfile(args.sample_list), "Sample index file {} cannot be found!".format(args.sample_list)
-
-	try:
-		with open(args.sample_list) as f_in:
-			for line in f_in:
-				record = line.strip().split("\t")
-				logger.debug("Checking sample {}".format(record[0]))
-				assert len(record)==3, "Every line has to have exactly 3 tab-delimited columns! Line with sample name {} does not satisify this requiremnt!".format(record[0])
-				assert os.path.isfile(record[1]), "Bam file {} cannot be found!".format(record[1])
-				assert os.path.isfile(record[1]+".bai"), "Bam file {} has not been indexed!".format(record[1])
-				assert os.path.isabs(record[1]), "Please use absolute path for bam file {}!".format(record[1])
-
-				if args.check_hard_clipped:
-					logger.debug("Checking existence of hard-clipped reads.")
-					cmd = "samtools view {} | bioawk -c sam 'BEGIN {{count=0}} ($cigar ~ /H/)&&(!and($flag,256)) {{count++}} END {{print count}}'".format(record[1])
-					logger.debug("Command: "+cmd)
-					out=os.popen(cmd).read().strip()
-					logger.debug("Results: "+out)
-					assert out=="0", "Bam file {} contains hard-clipped reads without proper flag (0x100) set! Please use -M or -Y options of BWA MEM!".format(record[1])
-
-				try:
-					float(record[2])
-					assert 0.0 <= float(record[2]) and float(record[2]) <= 1.0, "Contamination rate of sample {0} has to be a float number between 0 and 1 instead of {1}!".format(record[0], record[2])
-				except:
-					logger.error("Contamination rate of sample {0} has to be a float number between 0 and 1 instead of {1}!".format(record[0], record[2]))
-					exit(1)
-
-	except Exception:
-		logger.error("There is something wrong with the sample index file. Check the logs for more information.")
-		print(sys.exc_info())
-            
-		raise sys.exc_info()[0]
-
-
 def validate_user_setting_germline(args):
-	#assert os.path.isfile(args.bamFile), "The bam list file {} cannot be found!".format(args.bamFile)
-	assert os.path.isfile(args.reference), "The genome reference fasta file {} cannot be found!".format(args.reference)
-	assert os.path.isdir(args.imputation_panel), "Filtered genotype file of 1KG3 ref panel {} cannot be found!".format(args.imputation_panel)
-	assert os.path.isfile(args.region), "The region file {} cannot be found!".format(args.region)
-	# check whether each bam file available	
-	for chr in range(1, 23):
-		bamFile = args.out + "/Bam/chr" +  str(chr) +  ".filter.bam.lst"
+	assert os.path.isfile(args.reference), \
+		"The genome reference fasta file {} cannot be found!".format(args.reference)
+	assert os.path.isdir(args.imputation_panel), \
+		"Imputation panel directory {} cannot be found!".format(args.imputation_panel)
+	assert os.path.isfile(args.region), \
+		"The region file {} cannot be found!".format(args.region)
+
+	# [PERF] uses CHROMS instead of range(1, 23)
+	for chrom in CHROMS:
+		bamFile = args.out + "/Bam/" + chrom + ".filter.bam.lst"
+		assert os.path.isfile(bamFile), \
+			"{} not found -- did preProcess complete?".format(bamFile)
 		with open(bamFile) as f_in:
 			for line in f_in:
 				line = line.strip()
-				assert os.path.isfile(line), "The bam file {} cannot be found!".format(line)
-				assert os.path.isfile(line + ".bai"), "The bam.bai file {} cannot be found!".format(line)
-	# check whether region files were set correctly 
+				assert os.path.isfile(line), \
+					"The bam file {} cannot be found!".format(line)
+				assert os.path.isfile(line + ".bai"), \
+					"The bam.bai file {} cannot be found!".format(line)
+
 	with open(args.region) as f_in:
 		for line in f_in:
 			record = line.strip().split(",")
-			assert len(record)==3 or len(record)==1, "Every line has to have exactly 3 comma-delimited columns chr1,1,100000 or chr1 (on the whole chromosome)! Line with region {} does not satisify this requiremnt!".format(line)
+			assert len(record) == 3 or len(record) == 1, \
+				("Every line needs exactly 3 comma-delimited columns "
+				 "(chr1,1,100000) or 1 (chr1). Offending line: {}".format(line))
 
 
 def check_dependencies(args):
-	programs_to_check = ("vcftools", "bgzip",  "bcftools", "beagle.27Jul16.86a.jar","samtools","picard.jar", "java")
+	# [ENV] Upstream asserted vcftools and picard.jar exist in apps/. Neither
+	#       is ever invoked anywhere in the codebase -- they were pure
+	#       friction. Removed. The remaining four are genuinely called.
+	for prog in ("bgzip", "bcftools", "samtools", "java"):
+		path = shutil.which(prog)
+		assert path is not None, \
+			"Program {} not found on PATH -- is duopogen_env active?".format(prog)
+		logger.debug("Using {} -> {}".format(prog, path))
+	assert os.path.isfile(BEAGLE_JAR), \
+		"Beagle jar not found at {}".format(BEAGLE_JAR)
 
-	for prog in programs_to_check:
-		out = os.popen("command -v {}".format(args.app_path + "/" + prog)).read()
-		assert out != "", "Program {} cannot be found!".format(prog)
 
-#	python_pkgs_to_check = ("drmaa",)
-
-#	for pkg in python_pkgs_to_check:
-#		out_pipe = os.popen('python -c "import {}"'.format(pkg))
-
-#		assert out_pipe.close() is None, "Python module {} has not been installed!".format(pkg)
-
+def runCMD(cmd):
+	# [FIX] Upstream read:
+	#           output = os.system(cmd)
+	#           if output == 0:
+	#               return(region)      <- NameError, `region` is undefined
+	#       It only triggered on SUCCESS, and lived in somatic.py where a
+	#       working duplicate shadowed it. Deleting somatic.py exposes it.
+	#       Upstream also swallowed nonzero exits entirely, so a failed
+	#       Beagle run surfaced as a missing file several steps later.
+	output = os.system(cmd)
+	assert output == 0, "command failed (exit {}): {}".format(output, cmd)
+	return cmd
 
 
 def addChr(in_bam, samtools):
-	# edit the sequence names for your output header
+	"""Prefix contig names with 'chr'. Only runs for BAMs aligned to a
+	bare-numbered reference. CellRanger-ARC output is already chr-prefixed,
+	so this is a no-op path for most users -- left on the slow pysam
+	implementation deliberately."""
 	prefix = 'chr'
-	out_bam=in_bam+"tmp.bam"
-	input_bam = pysam.AlignmentFile(in_bam,"rb")
+	out_bam = in_bam + "tmp.bam"
+	input_bam = pysam.AlignmentFile(in_bam, "rb")
 	new_head = input_bam.header.to_dict()
 	for seq in new_head['SQ']:
-		seq['SN'] = prefix  + seq['SN']
-	# create output BAM with newly defined header
+		seq['SN'] = prefix + seq['SN']
 	with pysam.AlignmentFile(out_bam, "wb", header=new_head) as outf:
 		for read in input_bam.fetch():
-			prefixed_chrom = prefix + read.reference_name
 			a = pysam.AlignedSegment(outf.header)
 			a.query_name = read.query_name
 			a.query_sequence = read.query_sequence
-			a.reference_name = prefixed_chrom
+			a.reference_name = prefix + read.reference_name
 			a.flag = read.flag
 			a.reference_start = read.reference_start
 			a.mapping_quality = read.mapping_quality
@@ -150,80 +139,74 @@ def addChr(in_bam, samtools):
 			a.tags = read.tags
 			outf.write(a)
 	input_bam.close()
-	outf.close()
-	os.system(samtools + " index " +  out_bam)
-	os.system(" mv " + out_bam + " " + in_bam)
-	os.system(" mv " + out_bam + ".bai  " + in_bam + ".bai")
-
+	subprocess.run([samtools, "index", out_bam], check=True)
+	os.replace(out_bam, in_bam)
+	os.replace(out_bam + ".bai", in_bam + ".bai")
 
 
 def BamFilter(myargs):
-	bamFile = myargs.get("bamFile")
-	search_chr = myargs.get("chr")
-	samtools = myargs.get("samtools")
-	chr = search_chr
-	id = myargs.get("id")
-	#samtools = myargs.get("samtools")
-	max_mismatch = myargs.get("max_mismatch")
-	out = myargs.get("out")
+	"""Keep reads with < max_mismatch alignment mismatches, per chromosome,
+	and stamp a read group derived from the sample id."""
+	bamFile      = myargs["bamFile"]
+	search_chr   = myargs["chr"]
+	samtools     = myargs["samtools"]
+	chrom        = search_chr
+	sample_id    = myargs["id"]
+	max_mismatch = myargs["max_mismatch"]
+	out          = myargs["out"]
+	threads      = myargs.get("bam_threads", 2)
 
-	os.system("mkdir -p " + out +  "/Bam")
-	infile = pysam.AlignmentFile(bamFile,"rb")
-	contig_names = infile.references
-	cnt=0 
-	for contig in contig_names:
-		if contig.startswith("chr"):
-			cnt=cnt+1
-	if cnt==0:
-			logger.info("The contig {} does not contain the prefix 'chr' and we will add 'chr' on it ".format(search_chr))
-			search_chr = search_chr[3:]
-			#searchBam = args.bamFile+".bam"
-			#addChr(args.bamFile, searchBam)
-			#infile.close()
-			#infile = pysam.AlignmentFile(searchBam,"rb")
+	os.makedirs(out + "/Bam", exist_ok=True)
 
-	tp =infile.header.to_dict()
-			
-	#print(tp)
-	#To avoid the format issue, we update the RG flag based on sample information
-	#if not "RG" in tp:
-	sampleID = os.path.splitext(os.path.basename(myargs["bamFile"]))[0]
-	tp1 = [{'SM':sampleID,'ID':sampleID, 'LB':"0.1", 'PL':"ILLUMINA", 'PU':sampleID}]
-	tp.update({'RG': tp1})
-		#print(tp)
-		#tp['RG'][0]['SM'] = 
-		#tp['RG'][0]['ID'] = os.path.splitext(os.path.basename(args.bamFile))[0]
-  
-	outfile =  pysam.AlignmentFile( out + "/Bam/" +id + "_" + chr + ".filter.bam", "wb", header=tp)
+	# Detect whether the BAM uses chr-prefixed contigs.
+	with pysam.AlignmentFile(bamFile, "rb") as probe:
+		has_chr = any(c.startswith("chr") for c in probe.references)
+	if not has_chr:
+		logger.info("Contigs lack a 'chr' prefix; will add it after filtering.")
+		search_chr = search_chr[3:]
+
+	outbam = "{}/Bam/{}_{}.filter.bam".format(out, sample_id, chrom)
+
+	# The RG that mpileup uses to name the sample. Upstream derived SM/ID
+	# from the BAM *filename*, which collides when several donors share a
+	# filename (e.g. every donor's atac_possorted_bam.bam). Using the id
+	# column from bam.lst instead.  [FIX]
+	rg = "ID:{0}\\tSM:{0}\\tLB:0.1\\tPL:ILLUMINA\\tPU:{0}".format(sample_id)
+
+	# [PERF] Upstream looped over every read in Python via pysam, rebuilding
+	#        each record, then wrote it back out -- roughly 1-3 us/read plus
+	#        full decompress/recompress in the interpreter. samtools does the
+	#        same work in C with threaded BGZF: expect ~20-50x.
+	#
+	#        The filter expression also encodes the [FIX] for upstream's
+	#        uninitialised `val`: upstream used two independent `if`s, so a
+	#        read carrying neither NM nor nM inherited the PREVIOUS read's
+	#        mismatch count (or raised NameError on record one). Here a read
+	#        with neither tag matches neither clause and is dropped.
+	#
+	#        Verify against the old path once with:
+	#            samtools view -c old.bam ; samtools view -c new.bam
+	expr = "([NM] < {0}) || ([nM] < {0})".format(max_mismatch)
+	view = [samtools, "view", "-@", str(threads), "-b",
+	        "-e", expr, bamFile, search_chr]
+	addrg = [samtools, "addreplacerg", "-@", str(threads),
+	         "-r", rg, "-o", outbam, "-"]
+
+	p1 = subprocess.Popen(view, stdout=subprocess.PIPE)
+	p2 = subprocess.Popen(addrg, stdin=p1.stdout)
+	p1.stdout.close()
+	p2.communicate()
+	assert p1.wait() == 0, "samtools view failed for {} {}".format(sample_id, chrom)
+	assert p2.returncode == 0, "samtools addreplacerg failed for {} {}".format(sample_id, chrom)
+
+	subprocess.run([samtools, "index", "-@", str(threads), outbam], check=True)
+	if not has_chr:
+		addChr(outbam, samtools)
+	return outbam
 
 
-	for s in infile.fetch(search_chr):  
-		#print(str(s.query_length)  + ":" + str(s.get_tag("AS")) + ":" + str(s.get_tag("NM")))
-		if s.has_tag("NM"):
-			val= s.get_tag("NM")
-		if s.has_tag("nM"):
-			val= s.get_tag("nM")                  
-		if val < max_mismatch:
-			outfile.write(s)
-	infile.close()
-	outfile.close()
-
-	os.system(samtools + " index " +  out + "/Bam/" + id+ "_"  + chr + ".filter.bam")
-	if cnt ==0:
-		addChr(out + "/Bam/" +  id+ "_" + chr+ ".filter.bam", samtools)
-	bamfile = out + "/Bam/" +  id+ "_" + chr+ ".filter.bam"
-	return(bamfile)
-	#args.bam_filter = args.out + "/Bam/" + args.chr + ".filter.bam"
-
-
-def robust_get_tag(read, tag_name):  
-	try:  
+def robust_get_tag(read, tag_name):
+	try:
 		return read.get_tag(tag_name)
 	except KeyError:
 		return "NotFound"
-
-def runCMD(cmd):
-	output = os.system(cmd)
-	if output == 0:
-		return(region)
-	#process = subprocess.run(cmd, shell=True, stdout=open(args.logfile, 'w'), stderr=open(args.logfile,'w'))
