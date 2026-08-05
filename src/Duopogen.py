@@ -82,17 +82,19 @@ def germline(args):
 			#   -v                   -> -Ou            (uncompressed BCF down the pipe)
 			#   --excl-flags 0       -> --ns 0         (skip-any-set)
 			#   --incl-flags 0       -> (default; no equivalent flag needed)
-			cmd1 = (bcftools + " mpileup -b " + bam_filter
+			cmd1 = ("( " + bcftools + " mpileup -b " + bam_filter
 				+ " -f " + args.reference + " -r " + jobid
 				+ " -q 20 -Q 20 --ns 0"
 				+ " -a FORMAT/DP -d 1000 -Ou ")
 			cmd1 += (" | " + bcftools + ' filter -e \'REF !~ "^[ATGC]$"\' -Ou '
 				+ " | " + bcftools + " norm -m-both -Ov -f " + args.reference)
-			# bcftools mpileup writes the non-ref symbolic allele as <*>;
-			# the old samtools mpileup wrote <X>. Matching only <X> would let
-			# every symbolic-allele record through into the gl.vcf.gz.
+			# bcftools mpileup writes the non-ref symbolic allele as <*>; the
+			# old samtools mpileup wrote <X>. norm -m-both above is what
+			# splits "A T,<*>" into separate records so this grep removes
+			# only the symbolic one -- without norm it removes EVERYTHING.
 			cmd1 += (" | grep -v -e '<X>' -e '<\\*>' | " + bgzip + " -c > "
-				+ out + "/germline/" + jobid + ".gl.vcf.gz")
+				+ out + "/germline/" + jobid + ".gl.vcf.gz"
+				+ " ) 2> " + out + "/germline/" + jobid + ".varScan.log")
 
 			# ---- imputation ---------------------------------------------
 			# [PERF] chrom= now carries the CHUNK interval, not just the
