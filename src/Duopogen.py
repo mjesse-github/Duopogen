@@ -75,21 +75,23 @@ def germline(args):
 			assert os.path.isfile(imputation_vcf), \
 				"Panel file not found: {}".format(imputation_vcf)
 
-			# ---- variant scan -------------------------------------------
-			# [FIX]  Upstream wrote `-b" + bam_filter` with no space. getopt
-			#        tolerates -bFILE, but it is one edit from breaking.
-			# [PERF] -d 10000000 -> 1000. The 10M cap is what produces
-			#        upstream's own "(mpileup) Max depth is above 1M.
-			#        Potential memory hog!" warning. At scRNA/scATAC depths
-			#        nothing is lost, and it removes the main OOM source
-			#        when several regions run concurrently.
-			cmd1 = (samtools + " mpileup -b " + bam_filter
+			# samtools 1.9 deprecated and 1.23 REMOVED VCF/BCF output from
+			# `samtools mpileup` -- no -t, no -v. bcftools mpileup is the
+			# supported path. Flag mapping is NOT one-to-one:
+			#   -t DP                -> -a FORMAT/DP   (bcftools -t = --targets!)
+			#   -v                   -> -Ou            (uncompressed BCF down the pipe)
+			#   --excl-flags 0       -> --ns 0         (skip-any-set)
+			#   --incl-flags 0       -> (default; no equivalent flag needed)
+			cmd1 = (bcftools + " mpileup -b " + bam_filter
 				+ " -f " + args.reference + " -r " + jobid
-				+ " -q 20 -Q 20 --incl-flags 0 --excl-flags 0 -t DP -d 1000 -v ")
-			cmd1 += (" | " + bcftools + " view "
-				+ " | " + bcftools + ' filter -e \'REF !~ "^[ATGC]$"\' '
-				+ " | " + bcftools + " norm -m-both -f " + args.reference)
-			cmd1 += (" | grep -v \"<X>\" | " + bgzip + " -c > "
+				+ " -q 20 -Q 20 --ns 0"
+				+ " -a FORMAT/DP -d 1000 -Ou ")
+			cmd1 += (" | " + bcftools + ' filter -e \'REF !~ "^[ATGC]$"\' -Ou '
+				+ " | " + bcftools + " norm -m-both -Ov -f " + args.reference)
+			# bcftools mpileup writes the non-ref symbolic allele as <*>;
+			# the old samtools mpileup wrote <X>. Matching only <X> would let
+			# every symbolic-allele record through into the gl.vcf.gz.
+			cmd1 += (" | grep -v -e '<X>' -e '<\\*>' | " + bgzip + " -c > "
 				+ out + "/germline/" + jobid + ".gl.vcf.gz")
 
 			# ---- imputation ---------------------------------------------
@@ -116,7 +118,7 @@ def germline(args):
 			# NOT changed: modelscale=2, niterations=0, impute=false.
 			# All three affect accuracy, not just speed. Do not touch them
 			# without a WGS-truth comparison.
-			cmd3 = (java + " -Xmx8g -jar " + BEAGLE_JAR
+			cmd3 = (java + " -Xmx20g -jar " + BEAGLE_JAR
 				+ " gl=" + out + "/germline/" + jobid + ".gl.vcf.gz"
 				+ " ref=" + imputation_vcf
 				+ "  chrom=" + jobid
@@ -132,7 +134,7 @@ def germline(args):
 			cmd4 = ("zcat " + out + "/germline/" + jobid + ".gp.vcf.gz > "
 				+ out + "/germline/" + jobid + ".germline.vcf")
 
-			cmd5 = (java + " -Xmx8g -jar " + BEAGLE_JAR
+			cmd5 = (java + " -Xmx20g -jar " + BEAGLE_JAR
 				+ " gt=" + out + "/germline/" + jobid + ".germline.vcf"
 				+ " ref=" + imputation_vcf
 				+ "  chrom=" + jobid
@@ -193,8 +195,9 @@ def preProcess(args):
 				 "(id,bam). Offending sample: {}".format(record[0]))
 			assert os.path.isfile(record[1]), \
 				"Bam file {} cannot be found!".format(record[1])
-			assert os.path.isfile(record[1] + ".bai"), \
-				"Bam file {} has not been indexed!".format(record[1])
+			assert (os.path.isfile(line + ".bai")      
+					or os.path.isfile(line + ".csi")), \
+					"Index for {} cannot be found!".format(line)
 			assert record[0] not in samples, \
 				"Duplicate sample id {} in {}".format(record[0], args.bamFile)
 			samples.append(record[0])

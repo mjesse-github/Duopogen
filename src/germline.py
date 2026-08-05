@@ -73,8 +73,9 @@ def validate_user_setting_germline(args):
 				line = line.strip()
 				assert os.path.isfile(line), \
 					"The bam file {} cannot be found!".format(line)
-				assert os.path.isfile(line + ".bai"), \
-					"The bam.bai file {} cannot be found!".format(line)
+				assert (os.path.isfile(line + ".bai")
+					or os.path.isfile(line + ".csi")), \
+					"Index for {} cannot be found!".format(line)
 
 	with open(args.region) as f_in:
 		for line in f_in:
