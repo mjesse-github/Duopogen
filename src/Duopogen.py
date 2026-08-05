@@ -195,9 +195,9 @@ def preProcess(args):
 				 "(id,bam). Offending sample: {}".format(record[0]))
 			assert os.path.isfile(record[1]), \
 				"Bam file {} cannot be found!".format(record[1])
-			assert (os.path.isfile(line + ".bai")      
-					or os.path.isfile(line + ".csi")), \
-					"Index for {} cannot be found!".format(line)
+			assert (os.path.isfile(record[1] + ".bai")      
+					or os.path.isfile(record[1] + ".csi")), \
+					"Index for {} cannot be found!".format(record[1])
 			assert record[0] not in samples, \
 				"Duplicate sample id {} in {}".format(record[0], args.bamFile)
 			samples.append(record[0])
