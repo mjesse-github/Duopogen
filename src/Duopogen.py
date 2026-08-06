@@ -86,7 +86,8 @@ def germline(args):
 				+ " -f " + args.reference + " -r " + jobid
 				+ " -q 20 -Q 20 --ns 0"
 				+ " -a FORMAT/DP -d 1000 -Ou ")
-			cmd1 += (" | " + bcftools + ' filter -e \'REF !~ "^[ATGC]$"\' -Ou '
+			cmd1 += (" | " + bcftools
+				+ ' filter -i \'REF="A" || REF="C" || REF="G" || REF="T"\' -Ou '
 				+ " | " + bcftools + " norm -m-both -Ov -f " + args.reference)
 			# bcftools mpileup writes the non-ref symbolic allele as <*>; the
 			# old samtools mpileup wrote <X>. norm -m-both above is what
@@ -95,6 +96,13 @@ def germline(args):
 			cmd1 += (" | grep -v -e '<X>' -e '<\\*>' | " + bgzip + " -c > "
 				+ out + "/germline/" + jobid + ".gl.vcf.gz"
 				+ " ) 2> " + out + "/germline/" + jobid + ".varScan.log")
+
+			#guard
+			cmd1 += ("\nn=$(" + bcftools + " view -H "
+				+ out + "/germline/" + jobid + ".gl.vcf.gz | head -1 | wc -l)"
+				+ "\n[ \"$n\" -gt 0 ] || { echo 'ERROR: " + jobid
+				+ " produced 0 variant records -- see "
+				+ jobid + ".varScan.log' >&2; exit 1; }")
 
 			# ---- imputation ---------------------------------------------
 			# [PERF] chrom= now carries the CHUNK interval, not just the

@@ -9,21 +9,19 @@ Changes from upstream are tagged in comments:
   [PERF]  speed / memory
   [3.14]  needed for Python 3.14
   [ENV]   binaries now come from PATH, not a vendored apps/ dir
+  [GUARD] fails fast on silently-empty output
 """
 
-import argparse
-import sys
 import os
 import logging
 import shutil
 import subprocess
 import pysam
-import multiprocessing as mp
-from multiprocessing import Pool
 
-# [ENV] Dropped: pandas, numpy, gzip, glob, re, time, VariantFile.
-#       None are used once the monovar tree is deleted. numpy+pandas alone
-#       cost ~1.5 s of interpreter startup, paid once per region job.
+# [ENV] Dropped: pandas, numpy, gzip, glob, re, time, VariantFile, argparse,
+#       sys, multiprocessing. None are used here once the monovar tree is
+#       deleted; Duopogen.py imports what it needs itself. numpy+pandas
+#       alone cost ~1.5 s of interpreter startup, paid once per region job.
 
 # [ENV] The only thing still vendored is the Beagle 4.1 jar. Beagle 5.x
 #       dropped gl= (genotype-likelihood) input, which this pipeline
@@ -73,6 +71,8 @@ def validate_user_setting_germline(args):
 				line = line.strip()
 				assert os.path.isfile(line), \
 					"The bam file {} cannot be found!".format(line)
+				# [FIX] accept CSI as well as BAI. htslib reads both, and
+				#       `samtools merge --write-index` emits CSI by default.
 				assert (os.path.isfile(line + ".bai")
 					or os.path.isfile(line + ".csi")), \
 					"Index for {} cannot be found!".format(line)
@@ -85,10 +85,11 @@ def validate_user_setting_germline(args):
 				 "(chr1,1,100000) or 1 (chr1). Offending line: {}".format(line))
 
 
-def check_dependencies(args):
+def check_dependencies(args=None):
 	# [ENV] Upstream asserted vcftools and picard.jar exist in apps/. Neither
 	#       is ever invoked anywhere in the codebase -- they were pure
 	#       friction. Removed. The remaining four are genuinely called.
+	#       `args` is accepted but unused; kept so existing calls still work.
 	for prog in ("bgzip", "bcftools", "samtools", "java"):
 		path = shutil.which(prog)
 		assert path is not None, \
@@ -159,12 +160,33 @@ def BamFilter(myargs):
 
 	os.makedirs(out + "/Bam", exist_ok=True)
 
-	# Detect whether the BAM uses chr-prefixed contigs.
+	# One pass over the header: contig naming, contig presence, tag presence.
 	with pysam.AlignmentFile(bamFile, "rb") as probe:
-		has_chr = any(c.startswith("chr") for c in probe.references)
-	if not has_chr:
-		logger.info("Contigs lack a 'chr' prefix; will add it after filtering.")
-		search_chr = search_chr[3:]
+		refs = set(probe.references)
+		has_chr = any(c.startswith("chr") for c in refs)
+		if not has_chr:
+			logger.info("%s: contigs lack a 'chr' prefix; will add it after "
+				"filtering.", sample_id)
+			search_chr = search_chr[3:]
+
+		# [GUARD] `samtools view` exits 0 on an unknown contig -- it only
+		#         warns "specifies an invalid region ... Continue anyway" and
+		#         emits an empty BAM. So p1.wait()==0 below cannot catch a
+		#         missing chromosome; check the header instead.
+		assert search_chr in refs, \
+			"{}: contig {} is not in {} (header has {} contigs)".format(
+				sample_id, search_chr, bamFile, len(refs))
+
+		# [GUARD] htslib filter expressions treat a MISSING aux tag as false,
+		#         so '[NM] < 3' silently discards every read in a BAM that
+		#         has no NM/nM. Probe before relying on it.
+		has_nm = False
+		for i, r in enumerate(probe.fetch(search_chr)):
+			if r.has_tag("NM") or r.has_tag("nM"):
+				has_nm = True
+				break
+			if i >= 1000:
+				break
 
 	outbam = "{}/Bam/{}_{}.filter.bam".format(out, sample_id, chrom)
 
@@ -175,7 +197,7 @@ def BamFilter(myargs):
 	rg = "ID:{0}\\tSM:{0}\\tLB:0.1\\tPL:ILLUMINA\\tPU:{0}".format(sample_id)
 
 	# [PERF] Upstream looped over every read in Python via pysam, rebuilding
-	#        each record, then wrote it back out -- roughly 1-3 us/read plus
+	#        each record, then writing it back out -- roughly 1-3 us/read plus
 	#        full decompress/recompress in the interpreter. samtools does the
 	#        same work in C with threaded BGZF: expect ~20-50x.
 	#
@@ -183,13 +205,18 @@ def BamFilter(myargs):
 	#        uninitialised `val`: upstream used two independent `if`s, so a
 	#        read carrying neither NM nor nM inherited the PREVIOUS read's
 	#        mismatch count (or raised NameError on record one). Here a read
-	#        with neither tag matches neither clause and is dropped.
-	#
-	#        Verify against the old path once with:
-	#            samtools view -c old.bam ; samtools view -c new.bam
-	expr = "([NM] < {0}) || ([nM] < {0})".format(max_mismatch)
-	view = [samtools, "view", "-@", str(threads), "-b",
-	        "-e", expr, bamFile, search_chr]
+	#        with neither tag matches neither clause and is dropped -- which
+	#        is why the has_nm probe above exists.
+	view = [samtools, "view", "-@", str(threads), "-b"]
+	if has_nm:
+		view += ["-e", "([NM] < {0}) || ([nM] < {0})".format(max_mismatch)]
+	else:
+		logger.warning("%s %s: no NM/nM tag in the first 1000 reads -- "
+			"skipping the mismatch filter (it would drop everything). "
+			"Run `samtools calmd -b in.bam ref.fa` first if you want it.",
+			sample_id, chrom)
+	view += [bamFile, search_chr]
+
 	addrg = [samtools, "addreplacerg", "-@", str(threads),
 	         "-r", rg, "-o", outbam, "-"]
 
@@ -198,16 +225,22 @@ def BamFilter(myargs):
 	p1.stdout.close()
 	p2.communicate()
 	assert p1.wait() == 0, "samtools view failed for {} {}".format(sample_id, chrom)
-	assert p2.returncode == 0, "samtools addreplacerg failed for {} {}".format(sample_id, chrom)
+	assert p2.returncode == 0, \
+		"samtools addreplacerg failed for {} {}".format(sample_id, chrom)
 
 	subprocess.run([samtools, "index", "-@", str(threads), outbam], check=True)
+
+	# [GUARD] An empty filtered BAM produces an empty pileup, an empty
+	#         gl.vcf.gz, and finally "No VCF records found" from Beagle --
+	#         three steps and ~40 min after the actual problem. Fail here.
+	n = int(subprocess.run([samtools, "view", "-c", outbam],
+		capture_output=True, text=True, check=True).stdout.strip())
+	assert n > 0, ("{} {}: filtered BAM is empty. Check coverage on this "
+		"contig, and that the mismatch filter is not over-aggressive "
+		"(max_mismatch={}, NM tag present={}).".format(
+			sample_id, chrom, max_mismatch, has_nm))
+	logger.debug("%s %s: %d reads kept", sample_id, chrom, n)
+
 	if not has_chr:
 		addChr(outbam, samtools)
 	return outbam
-
-
-def robust_get_tag(read, tag_name):
-	try:
-		return read.get_tag(tag_name)
-	except KeyError:
-		return "NotFound"
