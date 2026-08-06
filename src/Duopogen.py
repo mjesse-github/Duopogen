@@ -99,7 +99,7 @@ def germline(args):
 
 			#guard
 			cmd1 += ("\nn=$(" + bcftools + " view -H "
-				+ out + "/germline/" + jobid + ".gl.vcf.gz | head -1 | wc -l)"
+				+ out + "/germline/" + jobid + ".gl.vcf.gz | wc -l)"
 				+ "\n[ \"$n\" -gt 0 ] || { echo 'ERROR: " + jobid
 				+ " produced 0 variant records -- see "
 				+ jobid + ".varScan.log' >&2; exit 1; }")
