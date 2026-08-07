@@ -153,7 +153,7 @@ def _prep_panel_cmd(args, chrom):
 		"tabix -s1 -b2 -e2 -f {st}\n").format(sv=p["sites_vcf"], st=p["sites_tsv"])
 
 	cmd += ("GLIMPSE2_chunk --input {sv} --region {chrom}"
-		" --map {gmap} --output {chunks} --threads {t}\n").format(
+		" --map {gmap} --sequential --output {chunks} --threads {t}\n").format(
 			sv=p["sites_vcf"], chrom=chrom, gmap=p["gmap"],
 			chunks=p["chunks"], t=args.bin_threads)
 
