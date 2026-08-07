@@ -20,6 +20,8 @@ import multiprocessing as mp
 from multiprocessing import Pool
 
 from germline import *
+from germline import *
+from glimpse import add_glimpse_subparser
 
 # [3.14] Python 3.14 changed the POSIX default start method from fork to
 #        forkserver (bpo/gh-84559). Upstream sets `samtools`, `bcftools`,
@@ -150,8 +152,18 @@ def germline(args):
 				+ "  chrom=" + jobid
 				+ " out=" + out + "/germline/" + jobid + ".phased "
 				+ "impute=false  modelscale=2  nthreads=2  gprobs=true  niterations=0")
-			cmd5 += "\nrm -f " + out + "/germline/" + jobid + ".germline.vcf"
 
+			# [FIX] Beagle 4.1 emits no ##contig lines, so bcftools warns on
+			#       every record and `bcftools concat` in the split stage
+			#       chokes. Restore them from the reference .fai, then index.
+			cmd5 += ("\n" + bcftools + " reheader --fai " + args.reference + ".fai"
+				+ " -o " + out + "/germline/" + jobid + ".phased.reheader.vcf.gz "
+				+ out + "/germline/" + jobid + ".phased.vcf.gz"
+				+ "\nmv " + out + "/germline/" + jobid + ".phased.reheader.vcf.gz "
+				+ out + "/germline/" + jobid + ".phased.vcf.gz"
+				+ "\n" + bcftools + " index -t "
+				+ out + "/germline/" + jobid + ".phased.vcf.gz")
+			cmd5 += "\nrm -f " + out + "/germline/" + jobid + ".germline.vcf"
 			logger.debug("region {} ({} sample(s))".format(jobid, N_sample))
 
 			# [FIX] Upstream opened one script file per region inside the
@@ -285,6 +297,8 @@ def main():
 		choices=['TRUE', 'FALSE'],
 		help="Generate job scripts only; do not run them")
 	gl.set_defaults(func=germline)
+	# GLIMPSE2 backend -- alternative to the Beagle 4.1 path above
+	add_glimpse_subparser(subparsers, common_parser, argparse)
 
 	args = parser.parse_args()
 	if args.subcommand is None:
