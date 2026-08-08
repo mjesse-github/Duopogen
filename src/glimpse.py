@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+# Original contribution by Mihkel Jesse, mihkel.jesse@gmail.com 
 """
 glimpse.py -- GLIMPSE2 imputation/phasing backend for duopogen.
 
