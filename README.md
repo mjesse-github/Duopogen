@@ -351,23 +351,6 @@ bcftools merge -Oz -o cohort.vcf.gz */glimpse.all.vcf.gz
 bcftools index -t cohort.vcf.gz
 ```
 
-**Rule of thumb:** ≤10 donors, either is fine — pool if you want joint output.
-Above that, run per-donor, or batch 10–20 per job to get parallelism and
-restartability without producing 150 files to merge.
-
-### Beagle is different, and worse
-
-Pooling helped Beagle in principle but **backfired in practice**. With 10
-donors pooled, nearly every panel site gained coverage in some donor, so the
-target marker set expanded to fill the reference panel — `target markers:
-49958` against `reference markers: 50000`. More markers means more windows, and
-each window rebuilds the model. Measured: ~2 h per window, ~18 windows for
-chr1, paid twice. chr1 alone exceeded a 24 h walltime.
-
-If you use the Beagle backend at cohort scale, split by step (`-s varScan`,
-then `-s varImpute`, then `-s varPhasing`) with `afterok` dependencies so each
-job stays under the walltime cap.
-
 ---
 
 ## Validation
