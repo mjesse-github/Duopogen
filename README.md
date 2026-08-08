@@ -15,21 +15,6 @@ A fork of [Monopogen](https://github.com/KChen-lab/Monopogen) (Dou et al.,
 The somatic module, the MonoVar tree, and the R scripts are removed. For
 somatic SNV calling, use upstream.
 
-## Benchmark
-
-**NB! The benchmark is preliminary!**
-
-GM12878 bulk ATAC, genome-wide, scored against GIAB HG001 v4.2.1
-high-confidence biallelic SNPs (n = 3,253,394). NA12878 and both parents were
-removed from the reference panel first.
-
-| | Beagle 4.1 | GLIMPSE2 |
-|---|---|---|
-| Variants recovered | 2,737,339 | **3,181,744** |
-| Recall | 84.1% | **97.8%** |
-| Non-ref discordance, shared sites | 0.514% | **0.500%** |
-| Non-ref calls in HC regions | 2,731,302 | 3,159,988 |
-
 **GLIMPSE2 is marginally more accurate on identical sites and recovers 444,405
 more true variants.** 
 
