@@ -3,8 +3,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --mem=128G
 #SBATCH -c 40
-#SBATCH --account=TEICHLAB-SL2-CPU
-#SBATCH --partition=icelake-himem
+#SBATCH --account=ACCOUNT
+#SBATCH --partition=PARTITION
 #SBATCH --output=logs/slurm-%x.%A_%a.out
 #SBATCH --mail-type=END,FAIL
 # sbatch --array=1-$(wc -l < donors.txt)%10 02_merge_array.sh

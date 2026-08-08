@@ -9,7 +9,6 @@
 #SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
-source /rfs/project/rfs-iCNyzSAaucw/mj701/miniconda3/etc/profile.d/conda.sh
 conda activate duopogen_env
 
 DUO="<where duopogen is installed>/Duopogen"
